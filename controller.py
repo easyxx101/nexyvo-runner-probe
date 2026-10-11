@@ -227,22 +227,69 @@ def fetch(root, binding):
     phase(root, 'FETCH', 'PASSED')
 
 
-def prerequisites(root, binding):
+def kvm_observation(open_readwrite=False):
+    """Fixed device only; retain finite categories, never exception strings."""
     path = Path('/dev/kvm')
-    if not path.exists() or path.is_symlink() or not stat.S_ISCHR(path.lstat().st_mode):
-        raise RuntimeError('KVM device required')
-    with (root/'raw/kvm-setup.log').open('wb') as log:
-        subprocess.run(['sudo','-n','tee','/etc/udev/rules.d/99-kvm4all.rules'],
-            input=b'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"\n',
-            stdout=log,stderr=subprocess.STDOUT,timeout=10,check=True)
-        for args in [['sudo','-n','udevadm','control','--reload-rules'],['sudo','-n','udevadm','trigger','--name-match=kvm']]:
-            subprocess.run(args,stdout=log,stderr=subprocess.STDOUT,timeout=10,check=True)
-    fd=os.open(path,os.O_RDWR|os.O_CLOEXEC);os.close(fd)
-    report=preflight()
-    report.update(actual_kvm_open_readwrite=True, public_controller_sha=binding['controller_sha'])
-    (root/'raw/actual-vm-capacity.json').write_bytes(canonical(report))
-    if report['status']!='PASSED':raise RuntimeError('Actual execution VM capacity refused')
-    phase(root,'CAPACITY','PASSED')
+    result = {'device_present':False, 'character_device':False, 'symlink':False,
+              'mode':None, 'rw_access':False, 'open_readwrite':False, 'failure_category':'NONE'}
+    try:
+        info = path.lstat()
+        result.update(device_present=True, character_device=stat.S_ISCHR(info.st_mode),
+                      symlink=stat.S_ISLNK(info.st_mode), mode=oct(stat.S_IMODE(info.st_mode)),
+                      rw_access=os.access(path,os.R_OK|os.W_OK))
+        if not result['character_device'] or result['symlink']:
+            result['failure_category']='KVM_DEVICE_INVALID'
+        elif open_readwrite:
+            fd=os.open(path,os.O_RDWR|os.O_CLOEXEC)
+            os.close(fd)
+            result['open_readwrite']=True
+    except OSError as error:
+        import errno
+        result['failure_category']=('KVM_DEVICE_ABSENT' if error.errno==errno.ENOENT else
+            'KVM_PERMISSION_DENIED' if error.errno in {errno.EACCES,errno.EPERM} else 'KVM_OPERATION_FAILED')
+        result['error_type']=type(error).__name__
+    return result
+
+
+def prerequisites(root, binding):
+    diagnostic={'status':'RUNNING','operation':'KVM_DEVICE_CHECK','before':None,
+                'after':None,'udev_settled':False,'settle_timeout_seconds':10}
+    try:
+        diagnostic['before']=kvm_observation()
+        if (not diagnostic['before']['character_device'] or diagnostic['before']['symlink']
+                or diagnostic['before']['failure_category']!='NONE'):
+            raise RuntimeError('KVM device required')
+        with (root/'raw/kvm-setup.log').open('wb') as log:
+            diagnostic['operation']='UDEV_RULE'
+            subprocess.run(['sudo','-n','tee','/etc/udev/rules.d/99-kvm4all.rules'],
+                input=b'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"\n',
+                stdout=log,stderr=subprocess.STDOUT,timeout=10,check=True)
+            for operation,args,timeout in [
+                    ('UDEV_RELOAD',['sudo','-n','udevadm','control','--reload-rules'],10),
+                    ('UDEV_TRIGGER',['sudo','-n','udevadm','trigger','--name-match=kvm'],10),
+                    ('UDEV_SETTLE',['sudo','-n','udevadm','settle','--timeout=10'],11)]:
+                diagnostic['operation']=operation
+                subprocess.run(args,stdout=log,stderr=subprocess.STDOUT,timeout=timeout,check=True)
+            diagnostic['udev_settled']=True
+        # trigger is asynchronous. Check the actual device once after bounded
+        # event completion; no permission-error retry or assumed open success.
+        diagnostic['operation']='KVM_OPEN'
+        diagnostic['after']=kvm_observation(open_readwrite=True)
+        if (not diagnostic['after']['rw_access'] or not diagnostic['after']['open_readwrite']
+                or diagnostic['after']['failure_category']!='NONE'):
+            raise RuntimeError('KVM actual readwrite open refused')
+        diagnostic['operation']='CAPACITY_MEASUREMENT'
+        report=preflight()
+        report.update(actual_kvm_open_readwrite=True, public_controller_sha=binding['controller_sha'])
+        (root/'raw/actual-vm-capacity.json').write_bytes(canonical(report))
+        if report['status']!='PASSED':raise RuntimeError('Actual execution VM capacity refused')
+        diagnostic.update(status='PASSED',operation='COMPLETE')
+        phase(root,'CAPACITY','PASSED')
+    except Exception as error:
+        diagnostic.update(status='FAILED',error_type=type(error).__name__)
+        raise
+    finally:
+        (root/'raw/prerequisites-diagnostic.json').write_bytes(canonical(diagnostic))
 
 
 def execution_env(environment, plan, root):
@@ -340,7 +387,8 @@ def main():
             if execute(root, binding): raise RuntimeError('Execution failed')
         else: seal_evidence(root, binding)
     except Exception as error:
-        if (root/'context.json').exists(): phase(root, args.phase.upper(), 'FAILED', type(error).__name__)
+        stage='CAPACITY' if args.phase=='prerequisites' else args.phase.upper()
+        if (root/'context.json').exists(): phase(root, stage, 'FAILED', type(error).__name__)
         if args.phase=='prerequisites' and root.exists():
             (root/'raw/aggregate.json').write_bytes(canonical({'status':'INCOMPLETE','failed_stage':'CAPACITY','capacity':'FAILED'}))
         # Never expose exception messages, paths, command output, private hashes or API URLs.
