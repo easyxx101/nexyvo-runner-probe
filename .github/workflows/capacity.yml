@@ -12,7 +12,103 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
+      - name: Observe KVM presence and permissions before setup
+        shell: bash
+        run: |
+          timeout 30s python3 - before <<'PY'
+          import errno
+          import json
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+          
+          phase = sys.argv[1]
+          p = Path("/dev/kvm")
+          report = {"scope": "KVM_ACCESS_ONLY", "phase": phase,
+                    "device_present": False, "character_device": False,
+                    "symlink": p.is_symlink(), "rw_access": False,
+                    "open_readwrite": False, "mode": None,
+                    "failure_category": "NONE", "emulator_started": False,
+                    "vm_created": False, "app_tests_executed": 0}
+          try:
+              info = p.lstat()
+              report.update(device_present=True, character_device=stat.S_ISCHR(info.st_mode),
+                            mode=oct(stat.S_IMODE(info.st_mode)),
+                            rw_access=os.access(p, os.R_OK | os.W_OK))
+              if not report["character_device"] or report["symlink"]:
+                  report["failure_category"] = "KVM_DEVICE_INVALID"
+              elif phase == "after":
+                  fd = os.open(p, os.O_RDWR | os.O_CLOEXEC)
+                  os.close(fd)
+                  report["open_readwrite"] = True
+          except OSError as error:
+              report["failure_category"] = (
+                  "KVM_DEVICE_ABSENT" if error.errno == errno.ENOENT else
+                  "KVM_PERMISSION_DENIED" if error.errno in (errno.EACCES, errno.EPERM) else
+                  "KVM_OPERATION_FAILED")
+          report["status"] = (
+              "OBSERVED" if phase == "before" else
+              "PASSED" if report["character_device"] and not report["symlink"]
+              and report["rw_access"] and report["open_readwrite"] else "FAILED")
+          print(json.dumps(report))
+          if phase == "after" and report["status"] != "PASSED":
+              raise SystemExit(1)
+          PY
+      - name: Enable documented KVM permissions on the disposable hosted VM
+        shell: bash
+        run: |
+          test -c /dev/kvm
+          test ! -L /dev/kvm
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | timeout 10s sudo -n tee /etc/udev/rules.d/99-kvm4all.rules > /dev/null
+          timeout 10s sudo -n udevadm control --reload-rules
+          timeout 10s sudo -n udevadm trigger --name-match=kvm
+      - name: Verify KVM readwrite open without creating a VM
+        if: always()
+        shell: bash
+        run: |
+          timeout 30s python3 - after <<'PY'
+          import errno
+          import json
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+          
+          phase = sys.argv[1]
+          p = Path("/dev/kvm")
+          report = {"scope": "KVM_ACCESS_ONLY", "phase": phase,
+                    "device_present": False, "character_device": False,
+                    "symlink": p.is_symlink(), "rw_access": False,
+                    "open_readwrite": False, "mode": None,
+                    "failure_category": "NONE", "emulator_started": False,
+                    "vm_created": False, "app_tests_executed": 0}
+          try:
+              info = p.lstat()
+              report.update(device_present=True, character_device=stat.S_ISCHR(info.st_mode),
+                            mode=oct(stat.S_IMODE(info.st_mode)),
+                            rw_access=os.access(p, os.R_OK | os.W_OK))
+              if not report["character_device"] or report["symlink"]:
+                  report["failure_category"] = "KVM_DEVICE_INVALID"
+              elif phase == "after":
+                  fd = os.open(p, os.O_RDWR | os.O_CLOEXEC)
+                  os.close(fd)
+                  report["open_readwrite"] = True
+          except OSError as error:
+              report["failure_category"] = (
+                  "KVM_DEVICE_ABSENT" if error.errno == errno.ENOENT else
+                  "KVM_PERMISSION_DENIED" if error.errno in (errno.EACCES, errno.EPERM) else
+                  "KVM_OPERATION_FAILED")
+          report["status"] = (
+              "OBSERVED" if phase == "before" else
+              "PASSED" if report["character_device"] and not report["symlink"]
+              and report["rw_access"] and report["open_readwrite"] else "FAILED")
+          print(json.dumps(report))
+          if phase == "after" and report["status"] != "PASSED":
+              raise SystemExit(1)
+          PY
       - name: Measure prerequisites without installing or launching anything
+        if: always()
         shell: bash
         run: |
           timeout 30s python3 - <<'PY'
